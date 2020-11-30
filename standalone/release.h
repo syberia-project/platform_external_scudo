@@ -93,7 +93,6 @@ public:
 
   bool isAllocated() const { return !!Buffer; }
 
-
   uptr getCount() const { return NumCounters; }
 
   uptr get(uptr Region, uptr I) const {
@@ -157,6 +156,11 @@ public:
     CurrentPage++;
   }
 
+  void skipPages(uptr N) {
+    closeOpenedRange();
+    CurrentPage += N;
+  }
+
   void finish() { closeOpenedRange(); }
 
 private:
@@ -175,11 +179,11 @@ private:
   uptr CurrentRangeStatePage = 0;
 };
 
-template <class TransferBatchT, class ReleaseRecorderT>
+template <class TransferBatchT, class ReleaseRecorderT, typename SkipRegionT>
 NOINLINE void
 releaseFreeMemoryToOS(const IntrusiveList<TransferBatchT> &FreeList, uptr Base,
                       uptr RegionSize, uptr NumberOfRegions, uptr BlockSize,
-                      ReleaseRecorderT *Recorder) {
+                      ReleaseRecorderT *Recorder, SkipRegionT SkipRegion) {
   const uptr PageSize = getPageSizeCached();
 
   // Figure out the number of chunks per page and whether we can take a fast
@@ -223,7 +227,8 @@ releaseFreeMemoryToOS(const IntrusiveList<TransferBatchT> &FreeList, uptr Base,
     return;
 
   const uptr PageSizeLog = getLog2(PageSize);
-  const uptr RoundedSize = NumberOfRegions * (PagesCount << PageSizeLog);
+  const uptr RoundedRegionSize = PagesCount << PageSizeLog;
+  const uptr RoundedSize = NumberOfRegions * RoundedRegionSize;
 
   // Iterate over free chunks and count how many free chunks affect each
   // allocated page.
@@ -248,6 +253,8 @@ releaseFreeMemoryToOS(const IntrusiveList<TransferBatchT> &FreeList, uptr Base,
     }
   } else {
     // In all other cases chunks might affect more than one page.
+    DCHECK_GE(RegionSize, BlockSize);
+    const uptr LastBlockInRegion = ((RegionSize / BlockSize) - 1U) * BlockSize;
     for (const auto &It : FreeList) {
       // See TransferBatch comment above.
       const bool IsTransferBatch =
@@ -258,9 +265,19 @@ releaseFreeMemoryToOS(const IntrusiveList<TransferBatchT> &FreeList, uptr Base,
         // This takes care of P < Base and P >= Base + RoundedSize.
         if (P < RoundedSize) {
           const uptr RegionIndex = NumberOfRegions == 1U ? 0 : P / RegionSize;
-          const uptr PInRegion = P - RegionIndex * RegionSize;
+          uptr PInRegion = P - RegionIndex * RegionSize;
           Counters.incRange(RegionIndex, PInRegion >> PageSizeLog,
                             (PInRegion + BlockSize - 1) >> PageSizeLog);
+          // The last block in a region might straddle a page, so if it's
+          // free, we mark the following "pretend" memory block(s) as free.
+          if (PInRegion == LastBlockInRegion) {
+            PInRegion += BlockSize;
+            while (PInRegion < RoundedRegionSize) {
+              Counters.incRange(RegionIndex, PInRegion >> PageSizeLog,
+                                (PInRegion + BlockSize - 1) >> PageSizeLog);
+              PInRegion += BlockSize;
+            }
+          }
         }
       }
     }
@@ -271,10 +288,15 @@ releaseFreeMemoryToOS(const IntrusiveList<TransferBatchT> &FreeList, uptr Base,
   FreePagesRangeTracker<ReleaseRecorderT> RangeTracker(Recorder);
   if (SameBlockCountPerPage) {
     // Fast path, every page has the same number of chunks affecting it.
-    for (uptr I = 0; I < NumberOfRegions; I++)
+    for (uptr I = 0; I < NumberOfRegions; I++) {
+      if (SkipRegion(I)) {
+        RangeTracker.skipPages(PagesCount);
+        continue;
+      }
       for (uptr J = 0; J < PagesCount; J++)
         RangeTracker.processNextPage(Counters.get(I, J) ==
                                      FullPagesBlockCountMax);
+    }
   } else {
     // Slow path, go through the pages keeping count how many chunks affect
     // each page.
@@ -286,6 +308,10 @@ releaseFreeMemoryToOS(const IntrusiveList<TransferBatchT> &FreeList, uptr Base,
     // up the number of chunks on the current page and checking on every step
     // whether the page boundary was crossed.
     for (uptr I = 0; I < NumberOfRegions; I++) {
+      if (SkipRegion(I)) {
+        RangeTracker.skipPages(PagesCount);
+        continue;
+      }
       uptr PrevPageBoundary = 0;
       uptr CurrentBoundary = 0;
       for (uptr J = 0; J < PagesCount; J++) {

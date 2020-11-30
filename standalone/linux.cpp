@@ -139,6 +139,14 @@ u32 getNumberOfCPUs() {
   return static_cast<u32>(CPU_COUNT(&CPUs));
 }
 
+u32 getThreadID() {
+#if SCUDO_ANDROID
+  return static_cast<u32>(gettid());
+#else
+  return static_cast<u32>(syscall(SYS_gettid));
+#endif
+}
+
 // Blocking is possibly unused if the getrandom block is not compiled in.
 bool getRandom(void *Buffer, uptr Length, UNUSED bool Blocking) {
   if (!Buffer || !Length || Length > MaxRandomLength)
@@ -190,7 +198,7 @@ void outputRaw(const char *Buffer) {
     }
     async_safe_write_log(AndroidLogInfo, "scudo", Buffer);
   } else {
-    write(2, Buffer, strlen(Buffer));
+    (void)write(2, Buffer, strlen(Buffer));
   }
 }
 
